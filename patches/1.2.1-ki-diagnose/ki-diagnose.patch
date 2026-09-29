@@ -1,0 +1,972 @@
+diff --git a/apps/backend/src/__tests__/aiFehler.test.ts b/apps/backend/src/__tests__/aiFehler.test.ts
+new file mode 100644
+index 0000000..09a776b
+--- /dev/null
++++ b/apps/backend/src/__tests__/aiFehler.test.ts
+@@ -0,0 +1,69 @@
++/**
++ * Fehlerklassen der KI-Aufrufe.
++ *
++ * Hintergrund: Vorher fielen 401, 400-ohne-Guthaben, 429 und 529 gemeinsam in
++ * `http_error` und erreichten den Nutzer als „KI nicht erreichbar". Diese
++ * Tests halten die Trennung fest — sie ist der ganze Zweck der Datei.
++ */
++import { describe, it, expect } from 'vitest';
++import { klassifiziereHttp, describeAiError } from '../services/ai/aiFehler.js';
++
++describe('klassifiziereHttp', () => {
++  it('trennt den abgelehnten Schlüssel vom Rest', () => {
++    expect(klassifiziereHttp(401, '{"error":{"message":"API key is invalid."}}')).toBe('auth');
++    expect(klassifiziereHttp(403, 'forbidden')).toBe('auth');
++  });
++
++  it('erkennt ein aufgebrauchtes Guthaben am Text, nicht am Status', () => {
++    // Anthropic liefert das als gewöhnlichen 400 — am Status allein ist es
++    // von einem Schemafehler nicht zu unterscheiden.
++    expect(klassifiziereHttp(400, 'Your credit balance is too low to access the API'))
++      .toBe('kein_guthaben');
++    expect(klassifiziereHttp(400, 'messages.0.content: field required')).toBe('http_error');
++  });
++
++  it('erkennt Rate-Limit und Überlastung als eigene, vorübergehende Fälle', () => {
++    expect(klassifiziereHttp(429, 'rate limit exceeded')).toBe('rate_limit');
++    expect(klassifiziereHttp(529, 'overloaded_error')).toBe('ueberlastet');
++    expect(klassifiziereHttp(500, 'internal')).toBe('ueberlastet');
++    expect(klassifiziereHttp(503, '')).toBe('ueberlastet');
++  });
++
++  it('behält die bisherige Modell-Erkennung — über Status und über Text', () => {
++    expect(klassifiziereHttp(404, '')).toBe('model_not_found');
++    expect(klassifiziereHttp(400, 'model: invalid model name')).toBe('model_not_found');
++    expect(klassifiziereHttp(400, 'no such model: llama9')).toBe('model_not_found');
++  });
++
++  it('lässt Unbekanntes im Rest-Topf', () => {
++    expect(klassifiziereHttp(418, 'teapot')).toBe('http_error');
++  });
++
++  it('ordnet Guthaben vor Modell ein, wenn beide Muster greifen könnten', () => {
++    // "quota" und "not found" im selben Text: Der Abrechnungsfall ist der
++    // handlungsrelevante, er muss zuerst greifen.
++    expect(klassifiziereHttp(400, 'quota exceeded, endpoint not found')).toBe('kein_guthaben');
++  });
++});
++
++describe('describeAiError', () => {
++  it('nennt bei jedem behandelten Fall einen nächsten Schritt', () => {
++    expect(describeAiError('auth')).toMatch(/Schlüssel/);
++    expect(describeAiError('auth')).toMatch(/Einstellungen/);
++    expect(describeAiError('kein_guthaben')).toMatch(/Guthaben|Ausgabelimit/);
++    expect(describeAiError('rate_limit')).toMatch(/erneut/);
++    expect(describeAiError('ueberlastet')).toMatch(/später erneut/);
++  });
++
++  it('nennt beim Netzfehler den Proxy als wahrscheinlichste Ursache', () => {
++    // Das war der eigentliche Befund: "nicht erreichbar" ohne Ursache hat
++    // niemandem geholfen. Der häufigste Grund ist kein Ausfall.
++    expect(describeAiError('network', 'fetch failed')).toMatch(/Proxy|Firewall/);
++    expect(describeAiError('network', 'fetch failed')).toContain('fetch failed');
++  });
++
++  it('gibt niemals den Aufruf selbst preis, nur die Antwort des Anbieters', () => {
++    const text = describeAiError('auth', 'HTTP 401: {"error":{"message":"API key is invalid."}}');
++    expect(text).not.toMatch(/sk-ant-/);
++  });
++});
+diff --git a/apps/backend/src/routes/settings.ts b/apps/backend/src/routes/settings.ts
+index 6f89968..371c821 100644
+--- a/apps/backend/src/routes/settings.ts
++++ b/apps/backend/src/routes/settings.ts
+@@ -7,6 +7,7 @@ import { listBackups, stageRestoreFromBackup, stageRestoreFromBuffer } from '../
+ 
+ const dbUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+ import { getAiSettings, saveAiSettings, testAiConnection } from '../services/ai/index.js';
++import { fuehreSelbsttestAus } from '../services/ai/selbsttest.js';
+ import { getMailSettings, saveMailSettings, maskedMailSettings } from '../services/mail/settings.js';
+ import { resetMailProvider, getMailProvider } from '../services/mail/index.js';
+ import { getSyncStatus, runImapSync, restartImapSync } from '../services/mail/imapSyncService.js';
+@@ -134,6 +135,23 @@ router.get('/ai/health', async (_req, res) => {
+   }
+ });
+ 
++/**
++ * GET /ai/selbsttest — sechs Einzelprüfungen statt einer roten Ampel.
++ *
++ * `/ai/health` beantwortet „geht es?" und wird alle paar Minuten gepollt.
++ * Diese Route beantwortet „woran liegt es?" und läuft nur auf Knopfdruck:
++ * Sie macht bis zu zwei Netzaufrufe, davon einen echten Modellaufruf. Deshalb
++ * bewusst ohne Cache und nicht im Puls.
++ */
++router.get('/ai/selbsttest', async (_req, res) => {
++  try {
++    res.json({ data: await fuehreSelbsttestAus() });
++  } catch (err) {
++    console.error('[ai/selbsttest]', err);
++    res.status(500).json({ error: 'Selbsttest konnte nicht ausgeführt werden' });
++  }
++});
++
+ // POST /ai/health/invalidate - force-expire the cache (called after settings change)
+ router.post('/ai/health/invalidate', (_req, res) => {
+   healthCache = null;
+diff --git a/apps/backend/src/services/ai/aiFehler.ts b/apps/backend/src/services/ai/aiFehler.ts
+new file mode 100644
+index 0000000..54d4bbc
+--- /dev/null
++++ b/apps/backend/src/services/ai/aiFehler.ts
+@@ -0,0 +1,102 @@
++/**
++ * Fehlerklassen der KI-Aufrufe — und der eine Ort, an dem eine HTTP-Antwort
++ * zu einer Klasse wird.
++ *
++ * Vorher entschied das jeder Anbieter-Zweig in index.ts für sich, und alle drei
++ * kannten dieselbe halbe Regel: „404 heisst Modell, alles andere heisst
++ * http_error". Damit fielen ein abgelehnter Schlüssel (401), ein aufgebrauchtes
++ * Guthaben (400) und ein Rate-Limit (429) in denselben Topf und erreichten den
++ * Nutzer als ein und derselbe Satz: „KI nicht erreichbar". Drei Fälle, drei
++ * völlig verschiedene Handgriffe, eine Meldung — das war die Lücke, nicht die
++ * Verbindung.
++ *
++ * Eigene Datei, weil der Typ sonst in index.ts wohnt und selbsttest.ts ihn
++ * braucht: index.ts importiert von hier, nie umgekehrt.
++ */
++
++export type AiErrorClass =
++  | 'ok'
++  | 'disabled'
++  | 'no_provider'
++  | 'network'
++  | 'timeout'
++  /** 401/403 — der Schlüssel wurde abgelehnt. */
++  | 'auth'
++  /** 400 mit Abrechnungsbezug — Verbindung steht, Konto nicht. */
++  | 'kein_guthaben'
++  /** 429 — zu viele Anfragen, vorübergehend. */
++  | 'rate_limit'
++  /** 529/5xx — der Anbieter selbst, vorübergehend. */
++  | 'ueberlastet'
++  | 'model_not_found'
++  /** Rest-Topf: HTTP-Fehler, der zu keiner der obigen Klassen passt. */
++  | 'http_error'
++  | 'empty_body'
++  | 'invalid_json';
++
++/**
++ * HTTP-Antwort → Fehlerklasse. Gilt für alle Anbieter.
++ *
++ * Reihenfolge ist Absicht: Die spezifischen Fälle stehen vor dem Rest-Topf,
++ * und die Guthaben-Prüfung vor dem generischen 400, weil Anthropic ein
++ * leeres Konto als gewöhnlichen `invalid_request_error` zurückgibt — am
++ * Status allein ist er von einem Schemafehler nicht zu unterscheiden.
++ *
++ * `body` sind die ersten Zeichen der Fehlerantwort des Anbieters, nicht unsere
++ * eigene Formulierung. Der Aufrufer liest sie ohnehin für `detail` aus.
++ */
++export function klassifiziereHttp(status: number, body: string): AiErrorClass {
++  if (status === 401 || status === 403) return 'auth';
++  if (status === 429) return 'rate_limit';
++  // 529 ist Anthropics „overloaded"; alles ab 500 ist ebenfalls Anbieterseite.
++  if (status >= 500) return 'ueberlastet';
++  if (status === 400 && /credit balance|insufficient|billing|quota/i.test(body)) return 'kein_guthaben';
++  if (status === 404 || /not found|invalid model|no such model|unknown model/i.test(body)) return 'model_not_found';
++  return 'http_error';
++}
++
++/**
++ * Klartext je Fehlerklasse: Ursache UND nächster Schritt in einem Satz.
++ * Enthält nie ein Geheimnis — `detail` ist die Antwort des Anbieters, nicht
++ * unsere Anfrage.
++ *
++ * Die `network`-Zeile nennt bewusst die wahrscheinliche Ursache samt Abhilfe,
++ * nach demselben Muster wie die OneDrive-Platzhalter-Meldung im Ordner-Watcher.
++ * „Nicht erreichbar" allein hat dort niemandem geholfen und hilft hier auch
++ * nicht: Der häufigste Grund ist kein Ausfall, sondern ein Proxy dazwischen.
++ */
++export function describeAiError(error: AiErrorClass | undefined, detail?: string): string {
++  switch (error) {
++    case 'disabled':
++      return detail || 'KI ist in den Einstellungen deaktiviert.';
++    case 'no_provider':
++      return 'Kein KI-Provider konfiguriert. Bitte unter Einstellungen → KI einen Provider einrichten.';
++    case 'network':
++      return ('Keine Verbindung zum KI-Endpunkt. Häufigste Ursachen: ein Unternehmensproxy oder '
++        + 'eine Firewall, die HTTPS mitliest — oder der Rechner ist offline. '
++        + `${detail ?? ''}`).trim();
++    case 'timeout':
++      return 'Zeitüberschreitung — die KI hat zu lange gebraucht. Bitte erneut versuchen.';
++    case 'auth':
++      return ('Der API-Schlüssel wurde abgelehnt. Er ist ungültig, widerrufen oder gehört zu einem '
++        + `anderen Konto. Einstellungen → KI → Schlüssel neu eintragen. ${detail ?? ''}`).trim();
++    case 'kein_guthaben':
++      return ('Das Konto beim Anbieter hat kein Guthaben mehr oder das Ausgabelimit ist erreicht. '
++        + `Die Verbindung steht — abgelehnt wird die Abrechnung, nicht der Zugriff. ${detail ?? ''}`).trim();
++    case 'rate_limit':
++      return 'Zu viele Anfragen in kurzer Zeit. Das gibt sich von selbst — in einer Minute erneut versuchen.';
++    case 'ueberlastet':
++      return ('Der Anbieter ist überlastet oder gestört. Kein Fehler auf deiner Seite — '
++        + `später erneut versuchen. ${detail ?? ''}`).trim();
++    case 'model_not_found':
++      return `Modell nicht gefunden oder für dieses Konto nicht freigeschaltet. ${detail ?? ''}`.trim();
++    case 'http_error':
++      return `KI-Endpoint antwortete mit Fehler. ${detail ?? ''}`.trim();
++    case 'empty_body':
++      return 'Verbindung ok, aber das Modell lieferte eine leere Antwort.';
++    case 'invalid_json':
++      return 'Verbindung ok, aber die Modellantwort war kein gültiges JSON.';
++    default:
++      return detail ?? 'Unbekannter KI-Fehler.';
++  }
++}
+diff --git a/apps/backend/src/services/ai/index.ts b/apps/backend/src/services/ai/index.ts
+index b985f6e..9047fdf 100644
+--- a/apps/backend/src/services/ai/index.ts
++++ b/apps/backend/src/services/ai/index.ts
+@@ -3,19 +3,15 @@ import type { AiSettings } from '@project-os/shared';
+ import { logExternalCall } from '../auditLog.js';
+ import { markJobStart, markJobDone, markJobError } from '../opsStatus.js';
+ import { currentLang } from './langContext.js';
++import { klassifiziereHttp, describeAiError, type AiErrorClass } from './aiFehler.js';
+ 
+ export type { AiSettings };
+ 
+-export type AiErrorClass =
+-  | 'ok'
+-  | 'disabled'
+-  | 'no_provider'
+-  | 'network'
+-  | 'timeout'
+-  | 'model_not_found'
+-  | 'http_error'
+-  | 'empty_body'
+-  | 'invalid_json';
++// Fehlerklassen und ihre Klartextfassung wohnen in aiFehler.ts — hier nur
++// weitergereicht, damit die rund zehn bestehenden Aufrufer (providerRouter,
++// buddy, aiExtract, aggregation) ihren Import nicht ändern müssen.
++export { klassifiziereHttp, describeAiError };
++export type { AiErrorClass };
+ 
+ export interface AiCallResult {
+   ok: boolean;
+@@ -55,6 +51,20 @@ export function saveAiSettings(settings: Partial<AiSettings>): AiSettings {
+   return merged;
+ }
+ 
++/**
++ * Fehlgeschlagene Aufrufe landen im selben Protokoll wie die erfolgreichen.
++ *
++ * `logExternalCall` schrieb bisher nur VOR dem Aufruf — dass er scheiterte und
++ * woran, stand nirgends. Einstellungen → Datenschutz zeigt die Tabelle bereits
++ * an; damit bekommt die Diagnose eine Historie, ohne einen neuen Bildschirm zu
++ * brauchen. Protokolliert werden Klasse, Status und die Fehlermeldung des
++ * Anbieters — nie der Schlüssel, nie der Prompt.
++ */
++function protokolliereFehler(host: string, error: AiErrorClass, status: number | undefined, detail: string): void {
++  const stat = status ? ` · HTTP ${status}` : '';
++  logExternalCall('C', host, 'ai.call.fehler', 0, `${error}${stat} · ${detail.slice(0, 200)}`);
++}
++
+ const stripSlash = (u: string) => u.replace(/\/$/, '');
+ 
+ /** Zone C minimization: cap at 6000 chars, preserve start+end if truncated. */
+@@ -64,21 +74,6 @@ export function minimizePrompt(text: string, limit = 6000): string {
+   return text.slice(0, half) + '\n…[gekürzt]…\n' + text.slice(-half);
+ }
+ 
+-/** Human-readable, actionable message per error class. Never contains secrets. */
+-export function describeAiError(error: AiErrorClass | undefined, detail?: string): string {
+-  switch (error) {
+-    case 'disabled': return detail || 'KI ist in den Einstellungen deaktiviert.';
+-    case 'no_provider': return 'Kein KI-Provider konfiguriert. Bitte unter Einstellungen → KI einen Provider einrichten.';
+-    case 'network': return `KI vorübergehend nicht erreichbar. ${detail ?? ''}`.trim();
+-    case 'timeout': return 'Zeitüberschreitung — KI hat zu lange gebraucht. Bitte erneut versuchen.';
+-    case 'model_not_found': return `Modell nicht gefunden. ${detail ?? ''}`.trim();
+-    case 'http_error': return `KI-Endpoint antwortete mit Fehler. ${detail ?? ''}`.trim();
+-    case 'empty_body': return 'Verbindung ok, aber das Modell lieferte eine leere Antwort.';
+-    case 'invalid_json': return 'Verbindung ok, aber die Modellantwort war kein gültiges JSON.';
+-    default: return detail ?? 'Unbekannter KI-Fehler.';
+-  }
+-}
+-
+ interface ChatOpts {
+   json?: boolean;
+   timeoutMs?: number;
+@@ -127,16 +122,18 @@ async function callAnthropic(
+   } catch (e) {
+     const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+     const error: AiErrorClass = isTimeout ? 'timeout' : 'network';
++    const detail = e instanceof Error ? e.message : String(e);
+     log('-', error);
+-    return { ok: false, error, detail: e instanceof Error ? e.message : String(e) };
++    protokolliereFehler('api.anthropic.com', error, undefined, detail);
++    return { ok: false, error, detail };
+   }
+ 
+   if (!res.ok) {
+     let detailText = '';
+     try { detailText = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+-    const looksLikeModel = res.status === 404 || /not found|invalid model/i.test(detailText);
+-    const error: AiErrorClass = looksLikeModel ? 'model_not_found' : 'http_error';
++    const error = klassifiziereHttp(res.status, detailText);
+     log(res.status, error);
++    protokolliereFehler('api.anthropic.com', error, res.status, detailText);
+     return { ok: false, error, httpStatus: res.status, detail: `HTTP ${res.status}: ${detailText}`.trim() };
+   }
+ 
+@@ -191,15 +188,18 @@ async function callPerplexity(
+   } catch (e) {
+     const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+     const error: AiErrorClass = isTimeout ? 'timeout' : 'network';
++    const detail = e instanceof Error ? e.message : String(e);
+     log('-', error);
+-    return { ok: false, error, detail: e instanceof Error ? e.message : String(e) };
++    protokolliereFehler('api.perplexity.ai', error, undefined, detail);
++    return { ok: false, error, detail };
+   }
+ 
+   if (!res.ok) {
+     let detailText = '';
+     try { detailText = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+-    const error: AiErrorClass = res.status === 404 ? 'model_not_found' : 'http_error';
++    const error = klassifiziereHttp(res.status, detailText);
+     log(res.status, error);
++    protokolliereFehler('api.perplexity.ai', error, res.status, detailText);
+     return { ok: false, error, httpStatus: res.status, detail: `HTTP ${res.status}: ${detailText}`.trim() };
+   }
+ 
+@@ -272,16 +272,20 @@ async function callOllamaCompat(
+   } catch (e) {
+     const isTimeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+     const error: AiErrorClass = isTimeout ? 'timeout' : 'network';
++    const detail = e instanceof Error ? e.message : String(e);
+     log('-', error);
+-    return { ok: false, error, detail: e instanceof Error ? e.message : String(e) };
++    // Ollama läuft lokal — dafür gibt es kein Zone-C-Protokoll, hier wie oben
++    // nur der externe Fall.
++    if (!isOllama) protokolliereFehler(new URL(endpoint).hostname, error, undefined, detail);
++    return { ok: false, error, detail };
+   }
+ 
+   if (!res.ok) {
+     let detailText = '';
+     try { detailText = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+-    const looksLikeModel = res.status === 404 || /not found|no such model|unknown model/i.test(detailText);
+-    const error: AiErrorClass = looksLikeModel ? 'model_not_found' : 'http_error';
++    const error = klassifiziereHttp(res.status, detailText);
+     log(res.status, error);
++    if (!isOllama) protokolliereFehler(new URL(endpoint).hostname, error, res.status, detailText);
+     return { ok: false, error, httpStatus: res.status, detail: `HTTP ${res.status}: ${detailText}`.trim() };
+   }
+ 
+diff --git a/apps/backend/src/services/ai/selbsttest.ts b/apps/backend/src/services/ai/selbsttest.ts
+new file mode 100644
+index 0000000..73a26f1
+--- /dev/null
++++ b/apps/backend/src/services/ai/selbsttest.ts
+@@ -0,0 +1,283 @@
++/**
++ * KI-Selbsttest — sechs Stufen, die den Ausfall benennen statt ihn zu melden.
++ *
++ * Auslöser: Ein Nutzer meldete „die KI ist nicht erreichbar, obwohl ich nichts
++ * verändert habe". Die App wusste zu diesem Zeitpunkt genau, woran es lag —
++ * `/ai/health` hält `error` und `detail` vor —, zeigte aber nur „KI nicht
++ * erreichbar". Ein abgelehnter Schlüssel, ein leeres Guthaben, ein Rate-Limit
++ * und ein Unternehmensproxy sahen identisch aus, und die Klärung dauerte
++ * länger als die Ursache.
++ *
++ * Aufbau bewusst wie `db/restoreIntegritaet.ts`: eine Liste von Einzelprüfungen
++ * mit Name, Ergebnis, Detail und nächstem Schritt. Das Muster kennen die Nutzer
++ * aus der Wiederherstellung, und es hat dieselbe Eigenschaft — es sagt nicht
++ * „fehlgeschlagen", es sagt, WO.
++ *
++ * Reihenfolge ist der eigentliche Wert: Die Stufen laufen vom Billigen zum
++ * Teuren und brechen ab, sobald eine trägt. Stufe 4 ist der Angelpunkt — sie
++ * fragt die Modell-Liste des Anbieters ab. Die kostet keinen Token, antwortet
++ * bei falschem Schlüssel mit 401 und wirft bei fehlender Verbindung. Damit
++ * trennt ein Klick die beiden Fälle, die am Telefon nie auseinanderzuhalten
++ * waren: liegt es am Netz oder am Konto.
++ */
++
++import { sqlite } from '../../db/index.js';
++import { APP_VERSION, type AiSettings } from '@project-os/shared';
++import { getAiSettings, aiCallChat, isCloudProviderBlocked } from './index.js';
++import { describeAiError } from './aiFehler.js';
++
++export interface SelbsttestStufe {
++  nr: number;
++  name: string;
++  /** true = bestanden, false = hier liegt es, null = nicht geprüft (Abbruch davor). */
++  ok: boolean | null;
++  detail: string;
++  naechsterSchritt?: string;
++}
++
++export interface SelbsttestBefund {
++  ok: boolean;
++  stufen: SelbsttestStufe[];
++  /** Klartextblock zum Kopieren und Verschicken. Enthält kein Geheimnis. */
++  bericht: string;
++  geprueftAm: string;
++}
++
++const stripSlash = (u: string) => u.replace(/\/$/, '');
++
++/** Zeitlimit der Vorprüfungen. Kurz: hier soll nichts hängen, hier soll etwas aussagen. */
++const VORPRUEFUNG_TIMEOUT_MS = 10_000;
++
++/**
++ * Der hinterlegte Schlüssel, so wie ihn `callAnthropic()` auflöst — erst die
++ * anbieterspezifische Ablage, dann das alte gemeinsame Feld. Wer nur eins von
++ * beiden prüft, meldet „kein Schlüssel", während der Aufruf gleich darauf
++ * funktioniert.
++ */
++function schluesselVon(s: AiSettings): string | undefined {
++  if (s.provider === 'anthropic') return s.anthropic?.apiKey || s.apiKey;
++  if (s.provider === 'perplexity') return s.perplexity?.apiKey || s.apiKey;
++  return s.apiKey;
++}
++
++function modellVon(s: AiSettings): string {
++  if (s.provider === 'anthropic') return s.anthropic?.model || s.model;
++  if (s.provider === 'perplexity') return s.perplexity?.model || s.model;
++  return s.model;
++}
++
++/**
++ * Ein Schlüssel darf im Bericht vorkommen, ein Geheimnis nicht. Präfix und
++ * Länge reichen, um „falsch eingefügt" von „gar nicht da" zu unterscheiden;
++ * mehr steht hier bewusst nie.
++ */
++function schluesselUmriss(key: string): string {
++  const praefix = key.slice(0, 7);
++  return `${praefix}… (${key.length} Zeichen)`;
++}
++
++/** Modell-Liste beim Anbieter abfragen — ohne Token zu verbrauchen. */
++async function holeModellListe(
++  s: AiSettings,
++  key: string | undefined,
++): Promise<{ ok: boolean; detail: string; modelle?: string[]; naechsterSchritt?: string }> {
++  try {
++    if (s.provider === 'anthropic') {
++      const base = stripSlash(s.anthropic?.baseUrl || 'https://api.anthropic.com');
++      const res = await fetch(`${base}/v1/models`, {
++        headers: { 'x-api-key': key ?? '', 'anthropic-version': '2023-06-01' },
++        signal: AbortSignal.timeout(VORPRUEFUNG_TIMEOUT_MS),
++      });
++      if (!res.ok) {
++        const text = (await res.text().catch(() => '')).slice(0, 200);
++        return {
++          ok: false,
++          detail: `HTTP ${res.status}: ${text}`.trim(),
++          naechsterSchritt: res.status === 401 || res.status === 403
++            ? 'Das Netz ist in Ordnung — der Schlüssel nicht. Einstellungen → KI → Schlüssel neu eintragen.'
++            : 'Verbindung steht, der Anbieter lehnt ab. Meldung oben weitergeben.',
++        };
++      }
++      const data = (await res.json()) as { data?: Array<{ id?: string }> };
++      const modelle = (data.data ?? []).map(m => m.id).filter((x): x is string => !!x);
++      return { ok: true, detail: `Erreichbar, Schlüssel akzeptiert · ${modelle.length} Modelle verfügbar`, modelle };
++    }
++
++    if (s.provider === 'ollama') {
++      const base = stripSlash(s.baseUrl);
++      const res = await fetch(`${base}/api/tags`, { signal: AbortSignal.timeout(VORPRUEFUNG_TIMEOUT_MS) });
++      if (!res.ok) {
++        return {
++          ok: false,
++          detail: `Endpunkt erreichbar, aber /api/tags → HTTP ${res.status}`,
++          naechsterSchritt: 'Läuft Ollama? In der Eingabeaufforderung: ollama list',
++        };
++      }
++      const data = (await res.json()) as { models?: Array<{ name?: string }> };
++      const modelle = (data.models ?? []).map(m => m.name).filter((x): x is string => !!x);
++      return { ok: true, detail: `Ollama erreichbar · ${modelle.length} Modelle installiert`, modelle };
++    }
++
++    return { ok: true, detail: 'Für diesen Anbieter gibt es keine kostenlose Modell-Liste — Stufe 6 prüft direkt.' };
++  } catch (e) {
++    const timeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
++    const meldung = e instanceof Error ? e.message : String(e);
++    return {
++      ok: false,
++      detail: timeout ? `Zeitüberschreitung nach ${VORPRUEFUNG_TIMEOUT_MS / 1000}s` : meldung,
++      naechsterSchritt: describeAiError(timeout ? 'timeout' : 'network'),
++    };
++  }
++}
++
++/**
++ * Passt das konfigurierte Modell auf einen Eintrag der Liste?
++ *
++ * Beidseitiges `startsWith`, weil beide Schreibweisen im Umlauf sind: die
++ * Einstellungen tragen mal die datierte Fassung („…-20251001"), mal die kurze.
++ * Ein strikter Vergleich meldete sonst ein fehlendes Modell, das es gibt.
++ */
++function modellPasst(konfiguriert: string, verfuegbar: string[]): boolean {
++  return verfuegbar.some(m => m === konfiguriert || m.startsWith(konfiguriert) || konfiguriert.startsWith(m));
++}
++
++export async function fuehreSelbsttestAus(): Promise<SelbsttestBefund> {
++  const s = getAiSettings();
++  const stufen: SelbsttestStufe[] = [];
++  const nichtGeprueft = (nr: number, name: string): SelbsttestStufe =>
++    ({ nr, name, ok: null, detail: 'nicht geprüft — eine frühere Stufe hat abgebrochen' });
++
++  // ── 1. Provider gewählt und eingeschaltet ──────────────────────────────────
++  const providerOk = s.provider !== 'none' && s.enabled;
++  stufen.push({
++    nr: 1,
++    name: 'Provider gewählt',
++    ok: providerOk,
++    detail: s.provider === 'none'
++      ? 'Kein Provider ausgewählt'
++      : `${s.provider}${s.enabled ? '' : ' — aber KI ist ausgeschaltet'}`,
++    naechsterSchritt: providerOk ? undefined : 'Einstellungen → KI: Provider wählen und den Schalter aktivieren.',
++  });
++  if (!providerOk) {
++    for (const [nr, name] of [[2, 'Schlüssel hinterlegt'], [3, 'Nur lokale KI'], [4, 'Netz, TLS und Konto'], [5, 'Modell verfügbar'], [6, 'Echter Aufruf']] as const) {
++      stufen.push(nichtGeprueft(nr, name));
++    }
++    return baueBefund(stufen, s);
++  }
++
++  // ── 2. Schlüssel hinterlegt ────────────────────────────────────────────────
++  const key = schluesselVon(s);
++  const brauchtSchluessel = s.provider !== 'ollama';
++  const keyOk = !brauchtSchluessel || !!key;
++  stufen.push({
++    nr: 2,
++    name: 'Schlüssel hinterlegt',
++    ok: keyOk,
++    detail: !brauchtSchluessel
++      ? 'Ollama braucht keinen Schlüssel'
++      : key ? schluesselUmriss(key) : 'kein Schlüssel gespeichert',
++    naechsterSchritt: keyOk
++      ? undefined
++      : 'Einstellungen → KI → API-Schlüssel eintragen. Hat der Schlüssel dort früher gestanden, ist er verlorengegangen — dann bitte melden.',
++  });
++
++  // ── 3. Nur lokale KI ───────────────────────────────────────────────────────
++  //
++  // Der stille Killer: Steht der Schalter, weist aiCallChat() jeden
++  // Cloud-Anbieter OHNE Netzwerkaufruf ab. Die Meldung lautet dann `disabled`
++  // und liest sich wie „ausgeschaltet" — obwohl der Nutzer die KI eingeschaltet
++  // hat und nur diese eine Governance-Regel dazwischensteht.
++  const gesperrt = isCloudProviderBlocked(s);
++  stufen.push({
++    nr: 3,
++    name: 'Nur lokale KI',
++    ok: !gesperrt,
++    detail: gesperrt
++      ? `„Nur lokale KI" ist aktiv — ${s.provider} wird deshalb gar nicht erst angefragt`
++      : 'aus — Cloud-Anbieter sind zugelassen',
++    naechsterSchritt: gesperrt ? 'Einstellungen → KI: „Nur lokale KI" ausschalten, oder Ollama als Provider wählen.' : undefined,
++  });
++  if (gesperrt || !keyOk) {
++    stufen.push(nichtGeprueft(4, 'Netz, TLS und Konto'), nichtGeprueft(5, 'Modell verfügbar'), nichtGeprueft(6, 'Echter Aufruf'));
++    return baueBefund(stufen, s);
++  }
++
++  // ── 4. Netz, TLS und Konto ─────────────────────────────────────────────────
++  const liste = await holeModellListe(s, key);
++  stufen.push({ nr: 4, name: 'Netz, TLS und Konto', ok: liste.ok, detail: liste.detail, naechsterSchritt: liste.naechsterSchritt });
++  if (!liste.ok) {
++    stufen.push(nichtGeprueft(5, 'Modell verfügbar'), nichtGeprueft(6, 'Echter Aufruf'));
++    return baueBefund(stufen, s);
++  }
++
++  // ── 5. Modell verfügbar ────────────────────────────────────────────────────
++  const modell = modellVon(s);
++  if (!liste.modelle) {
++    stufen.push({ nr: 5, name: 'Modell verfügbar', ok: null, detail: 'für diesen Anbieter nicht prüfbar' });
++  } else {
++    const passt = modellPasst(modell, liste.modelle);
++    stufen.push({
++      nr: 5,
++      name: 'Modell verfügbar',
++      ok: passt,
++      detail: passt ? `„${modell}" ist freigeschaltet` : `„${modell}" steht nicht in der Liste des Kontos`,
++      naechsterSchritt: passt ? undefined : `Verfügbar wären: ${liste.modelle.slice(0, 6).join(', ')}`,
++    });
++  }
++
++  // ── 6. Echter Aufruf ───────────────────────────────────────────────────────
++  const begonnen = Date.now();
++  const probe = await aiCallChat('Antworte nur mit: OK', undefined, {
++    settings: { ...s, enabled: true },
++    timeoutMs: 20_000,
++  });
++  const dauer = Date.now() - begonnen;
++  stufen.push({
++    nr: 6,
++    name: 'Echter Aufruf',
++    ok: probe.ok,
++    detail: probe.ok ? `Antwort nach ${dauer} ms` : describeAiError(probe.error, probe.detail),
++    naechsterSchritt: probe.ok ? undefined : 'Die Stufen darüber sind grün — das Modell antwortet trotzdem nicht. Bericht kopieren und weitergeben.',
++  });
++
++  return baueBefund(stufen, s);
++}
++
++/** Letzte KI-Aufrufe aus dem Prüfpfad — die Historie zum Befund. */
++function letzteAufrufe(n: number): string[] {
++  try {
++    const rows = sqlite.prepare(
++      `SELECT ts, action, detail FROM audit_log WHERE action LIKE 'ai.call%' ORDER BY ts DESC LIMIT ?`,
++    ).all(n) as Array<{ ts: string; action: string; detail: string | null }>;
++    return rows.map(r => `${r.ts} ${r.action}${r.detail ? ` · ${r.detail}` : ''}`);
++  } catch {
++    return [];
++  }
++}
++
++function zeichen(ok: boolean | null): string {
++  return ok === null ? '–     ' : ok ? 'ok    ' : 'FEHLER';
++}
++
++function baueBefund(stufen: SelbsttestStufe[], s: AiSettings): SelbsttestBefund {
++  const geprueftAm = new Date().toISOString();
++  const key = schluesselVon(s);
++
++  const zeilen = [
++    `Opero hr-onsite ${APP_VERSION} · ${process.platform} ${process.arch} · Node ${process.versions.node}`,
++    `Provider: ${s.provider} · Modell: ${modellVon(s)} · Schlüssel hinterlegt: ${key ? 'ja' : 'nein'}`,
++    '',
++    ...stufen.map(st => `${st.nr} ${st.name.padEnd(22)} ${zeichen(st.ok)}  ${st.detail}`
++      + (st.naechsterSchritt ? `\n${''.padEnd(32)}→ ${st.naechsterSchritt}` : '')),
++    '',
++    `HTTPS_PROXY: ${process.env.HTTPS_PROXY ?? 'nicht gesetzt'} · HTTP_PROXY: ${process.env.HTTP_PROXY ?? 'nicht gesetzt'}`,
++    `Geprüft am: ${geprueftAm}`,
++  ];
++
++  const historie = letzteAufrufe(3);
++  if (historie.length > 0) zeilen.push('', 'Letzte KI-Aufrufe:', ...historie.map(h => `  ${h}`));
++
++  // Eine Stufe mit `ok: null` ist kein Fehler — sie wurde nicht geprüft. Der
++  // Gesamtbefund hängt allein daran, ob eine Stufe tatsächlich gerissen ist.
++  return { ok: stufen.every(st => st.ok !== false), stufen, bericht: zeilen.join('\n'), geprueftAm };
++}
+diff --git a/apps/frontend/src/App.tsx b/apps/frontend/src/App.tsx
+index ba3be01..1166cc6 100644
+--- a/apps/frontend/src/App.tsx
++++ b/apps/frontend/src/App.tsx
+@@ -42,22 +42,56 @@ import { useAiHealth } from './hooks/useAiHealth';
+ import { api } from './lib/api';
+ import { AlertTriangle, X } from 'lucide-react';
+ 
++/**
++ * Fehlerklasse → Überschrift.
++ *
++ * Bisher stand über jedem Ausfall derselbe Satz, und darunter die ersten 120
++ * Zeichen der Rohantwort. Bei einem HTTP-Fehler war das oft `HTTP 400:
++ * {"type":"error","error":{"type":...` — abgeschnitten, bevor die Aussage kam.
++ * Die Klasse liefert `/ai/health` längst mit; sie wurde nur nie gelesen.
++ */
++const BANNER_UEBERSCHRIFT: Record<string, string> = {
++  auth: 'ai.banner.headline.auth',
++  kein_guthaben: 'ai.banner.headline.kein_guthaben',
++  rate_limit: 'ai.banner.headline.rate_limit',
++  ueberlastet: 'ai.banner.headline.ueberlastet',
++  network: 'ai.banner.headline.network',
++  timeout: 'ai.banner.headline.timeout',
++  model_not_found: 'ai.banner.headline.model_not_found',
++};
++
+ function AiWarningBanner() {
+   const { data: health } = useAiHealth();
+   const navigate = useNavigate();
+   const [dismissed, setDismissed] = useState(false);
++  const [detailOffen, setDetailOffen] = useState(false);
+   const { t } = useT();
+ 
+   if (dismissed || !health || health.status !== 'unavailable') return null;
+ 
++  const provider = health.provider ?? 'unbekannt';
++  const model = health.model ?? '–';
++  // Unbekannte Klasse fällt auf die bisherige Sammelmeldung zurück.
++  const schluessel = (health.error && BANNER_UEBERSCHRIFT[health.error]) ?? 'ai.banner.unavailable';
++
+   return (
+-    <div className="no-print flex items-center gap-3 px-6 py-2 text-xs" style={{ backgroundColor: 'rgba(251,146,60,0.12)', borderBottom: '1px solid rgba(251,146,60,0.25)' }}>
+-      <AlertTriangle size={13} className="text-amber-400 shrink-0" />
+-      <span className="text-amber-300 flex-1">
+-        {t('ai.banner.unavailable', { provider: health.provider ?? 'unbekannt', model: health.model ?? '–' })}
+-        {health.detail && <span className="text-amber-500"> — {health.detail.slice(0, 120)}</span>}
+-      </span>
+-      <button onClick={() => navigate('/settings')} className="text-amber-400 hover:text-amber-200 underline shrink-0">{t('ai.banner.settings')}</button>
++    <div className="no-print flex items-start gap-3 px-6 py-2 text-xs" style={{ backgroundColor: 'rgba(251,146,60,0.12)', borderBottom: '1px solid rgba(251,146,60,0.25)' }}>
++      <AlertTriangle size={13} className="text-amber-400 shrink-0 mt-0.5" />
++      <div className="text-amber-300 flex-1 min-w-0">
++        <span>{t(schluessel, { provider, model })}</span>
++        {health.detail && (
++          <>
++            {' '}
++            <button onClick={() => setDetailOffen(v => !v)} className="text-amber-500 underline">
++              {t('common.details')}
++            </button>
++            {detailOffen && (
++              <div className="mt-1 whitespace-pre-wrap break-words text-amber-500">{health.detail}</div>
++            )}
++          </>
++        )}
++      </div>
++      <button onClick={() => navigate('/settings')} className="text-amber-400 hover:text-amber-200 underline shrink-0">{t('ai.banner.selbsttest')}</button>
+       <button onClick={() => setDismissed(true)} className="text-amber-600 hover:text-amber-400 shrink-0"><X size={13} /></button>
+     </div>
+   );
+diff --git a/apps/frontend/src/components/layout/TopBar.tsx b/apps/frontend/src/components/layout/TopBar.tsx
+index f20242a..1001f88 100644
+--- a/apps/frontend/src/components/layout/TopBar.tsx
++++ b/apps/frontend/src/components/layout/TopBar.tsx
+@@ -242,9 +242,15 @@ function AiHealthDot() {
+   const { status, provider, model } = health;
+   if (status === 'no_provider') return null;
+ 
++  // Der Tooltip war die einzige Stelle, an der die Ampel etwas sagen konnte —
++  // und sagte nur "nicht erreichbar · Provider · Modell". Die Fehlermeldung des
++  // Anbieters liegt in `detail` und gehört genau hierhin: Wer auf den roten
++  // Punkt zeigt, will wissen, woran es liegt, nicht dass es klemmt.
++  const ursache = health.detail ? `\n${health.detail.slice(0, 200)}` : '';
++
+   const dot: Record<string, { color: string; pulse: boolean; title: string }> = {
+     connected:   { color: '#4ade80', pulse: false, title: t('topbar.aiActiveTitle', { provider: provider ?? '', model: model ?? '' }) },
+-    unavailable: { color: '#f87171', pulse: true,  title: t('topbar.aiUnavailableTitle', { provider: provider ?? '', model: model ?? '' }) },
++    unavailable: { color: '#f87171', pulse: true,  title: t('topbar.aiUnavailableTitle', { provider: provider ?? '', model: model ?? '' }) + ursache },
+     disabled:    { color: '#64748b', pulse: false, title: t('topbar.aiDisabledTitle') },
+   };
+   const cfg = dot[status] ?? dot.disabled;
+diff --git a/apps/frontend/src/components/settings/KiSelbsttest.tsx b/apps/frontend/src/components/settings/KiSelbsttest.tsx
+new file mode 100644
+index 0000000..ff8b3f7
+--- /dev/null
++++ b/apps/frontend/src/components/settings/KiSelbsttest.tsx
+@@ -0,0 +1,128 @@
++/**
++ * Selbsttest-Tafel unter Einstellungen → KI.
++ *
++ * Gegenstück zu `services/ai/selbsttest.ts`. Bewusst dieselbe Darstellung wie
++ * die Einzelprüfungen nach einer Wiederherstellung: eine Zeile je Prüfung, mit
++ * Ergebnis, Detail und — wo es eins gibt — dem nächsten Schritt. Der Nutzer
++ * soll nicht lesen, DASS es klemmt, sondern WO.
++ *
++ * Läuft nur auf Knopfdruck. Die letzte Stufe ist ein echter Modellaufruf; das
++ * gehört nicht in einen Hintergrund-Puls.
++ */
++import { useState } from 'react';
++import { useMutation } from '@tanstack/react-query';
++import { Check, X, Minus, Copy, Stethoscope } from 'lucide-react';
++import { api } from '../../lib/api';
++import { useT } from '../../i18n';
++
++interface SelbsttestStufe {
++  nr: number;
++  name: string;
++  ok: boolean | null;
++  detail: string;
++  naechsterSchritt?: string;
++}
++
++interface SelbsttestBefund {
++  ok: boolean;
++  stufen: SelbsttestStufe[];
++  bericht: string;
++  geprueftAm: string;
++}
++
++function Symbol({ ok }: { ok: boolean | null }) {
++  if (ok === null) return <Minus size={13} className="shrink-0 mt-0.5" style={{ color: 'var(--text-muted)' }} />;
++  if (ok) return <Check size={13} className="shrink-0 mt-0.5" style={{ color: 'var(--signal-ok)' }} />;
++  return <X size={13} className="shrink-0 mt-0.5" style={{ color: 'var(--signal-urgent)' }} />;
++}
++
++export function KiSelbsttest() {
++  const { t } = useT();
++  const [kopiert, setKopiert] = useState(false);
++
++  const lauf = useMutation({
++    mutationFn: () => api.get<SelbsttestBefund>('/settings/ai/selbsttest'),
++  });
++  const befund = lauf.data;
++
++  async function kopiereBericht(bericht: string) {
++    try {
++      await navigator.clipboard.writeText(bericht);
++      setKopiert(true);
++      setTimeout(() => setKopiert(false), 2000);
++    } catch {
++      // Zwischenablage gesperrt (Fokus, Richtlinie) — der Text steht ohnehin
++      // unten im Kasten und lässt sich markieren.
++    }
++  }
++
++  return (
++    <section className="rounded-xl border p-6 mb-5" style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}>
++      <div className="flex items-center gap-2 mb-1">
++        <Stethoscope size={16} className="text-accent" />
++        <h2 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>{t('settings.ki.selbsttest.title')}</h2>
++      </div>
++      <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>{t('settings.ki.selbsttest.intro')}</p>
++
++      <div className="flex items-center gap-2 mb-4">
++        <button
++          onClick={() => lauf.mutate()}
++          disabled={lauf.isPending}
++          className="px-3 py-1.5 rounded text-xs font-medium disabled:opacity-40"
++          style={{ backgroundColor: 'var(--accent-muted)', color: 'var(--accent)', border: '1px solid var(--border)' }}
++        >
++          {lauf.isPending ? t('settings.ki.selbsttest.running') : t('settings.ki.selbsttest.run')}
++        </button>
++        {befund && (
++          <button
++            onClick={() => kopiereBericht(befund.bericht)}
++            className="flex items-center gap-1 px-3 py-1.5 rounded text-xs"
++            style={{ backgroundColor: 'var(--inset)', color: 'var(--text-muted)', border: '1px solid var(--border)' }}
++          >
++            <Copy size={11} /> {kopiert ? t('settings.ki.selbsttest.copied') : t('settings.ki.selbsttest.copy')}
++          </button>
++        )}
++      </div>
++
++      {lauf.isError && (
++        <div className="text-xs mb-3" style={{ color: 'var(--signal-urgent)' }}>
++          {(lauf.error as Error).message}
++        </div>
++      )}
++
++      {befund && (
++        <>
++          <div className="space-y-2">
++            {befund.stufen.map(st => (
++              <div key={st.nr} className="flex items-start gap-2 text-xs">
++                <Symbol ok={st.ok} />
++                <div className="flex-1 min-w-0">
++                  <div style={{ color: 'var(--text)' }}>
++                    <span className="font-medium">{st.nr}. {st.name}</span>
++                    <span style={{ color: 'var(--text-muted)' }}> — {st.detail}</span>
++                  </div>
++                  {st.naechsterSchritt && (
++                    <div className="mt-0.5" style={{ color: st.ok === false ? 'var(--signal-urgent)' : 'var(--text-muted)' }}>
++                      → {st.naechsterSchritt}
++                    </div>
++                  )}
++                </div>
++              </div>
++            ))}
++          </div>
++
++          <div className="mt-3 text-xs" style={{ color: befund.ok ? 'var(--signal-ok)' : 'var(--signal-urgent)' }}>
++            {befund.ok ? t('settings.ki.selbsttest.allOk') : t('settings.ki.selbsttest.failed')}
++          </div>
++
++          {/* Der Bericht steht sichtbar da, nicht nur in der Zwischenablage —
++              wo die gesperrt ist, muss er sich markieren lassen. */}
++          <pre
++            className="mt-3 p-3 rounded-lg overflow-x-auto text-2xs whitespace-pre-wrap break-words"
++            style={{ backgroundColor: 'var(--inset)', color: 'var(--text-muted)' }}
++          >{befund.bericht}</pre>
++        </>
++      )}
++    </section>
++  );
++}
+diff --git a/apps/frontend/src/i18n/messages.ts b/apps/frontend/src/i18n/messages.ts
+index 90d512f..044f2f5 100644
+--- a/apps/frontend/src/i18n/messages.ts
++++ b/apps/frontend/src/i18n/messages.ts
+@@ -581,6 +581,25 @@ const de: Dict = {
+   'error.page.home': 'Dashboard',
+   // ── KI-Banner ─────────────────────────────────────────────────────────────
+   'ai.banner.unavailable': 'KI-Provider nicht erreichbar ({provider} · {model}). Heuristische Extraktion bleibt aktiv; KI-Reanalyse und Briefing-KI sind derzeit nicht verfügbar.',
++  // Überschriften je Fehlerklasse. Die Meldung darunter blieb bisher für alle
++  // Fälle dieselbe — ein abgelehnter Schlüssel las sich wie ein Netzausfall.
++  'ai.banner.headline.auth': 'Der API-Schlüssel wurde abgelehnt ({provider}). Er ist ungültig, widerrufen oder gehört zu einem anderen Konto.',
++  'ai.banner.headline.kein_guthaben': 'Das Konto bei {provider} hat kein Guthaben mehr oder das Ausgabelimit ist erreicht — die Verbindung steht.',
++  'ai.banner.headline.rate_limit': 'Zu viele Anfragen in kurzer Zeit ({provider}). Das gibt sich von selbst.',
++  'ai.banner.headline.ueberlastet': '{provider} ist überlastet oder gestört. Kein Fehler auf diesem Rechner.',
++  'ai.banner.headline.network': 'Keine Verbindung zu {provider}. Häufigste Ursache ist ein Unternehmensproxy oder eine Firewall, die HTTPS mitliest — kein Ausfall.',
++  'ai.banner.headline.model_not_found': 'Das Modell „{model}" ist für dieses Konto nicht freigeschaltet.',
++  'ai.banner.headline.timeout': '{provider} hat zu lange gebraucht ({model}).',
++  'ai.banner.selbsttest': 'Selbsttest',
++  'settings.ki.selbsttest.title': 'Selbsttest',
++  'settings.ki.selbsttest.intro': 'Sechs Prüfungen, vom Billigen zum Teuren. Die erste, die reisst, ist die Ursache.',
++  'settings.ki.selbsttest.run': 'Selbsttest starten',
++  'settings.ki.selbsttest.running': 'Läuft…',
++  'settings.ki.selbsttest.copy': 'Diagnose kopieren',
++  'settings.ki.selbsttest.copied': 'Kopiert',
++  'settings.ki.selbsttest.skipped': 'nicht geprüft',
++  'settings.ki.selbsttest.allOk': 'Alle Prüfungen bestanden.',
++  'settings.ki.selbsttest.failed': 'Die Ursache steht in der ersten roten Zeile.',
+   'ai.banner.settings': 'Einstellungen',
+   // ── Aufgaben (TaskList) ───────────────────────────────────────────────────
+   'tasks.col.task': 'Aufgabe',
+@@ -3308,6 +3327,23 @@ const en: Dict = {
+   'error.page.home': 'Dashboard',
+   // ── AI Banner ─────────────────────────────────────────────────────────────
+   'ai.banner.unavailable': 'AI provider unavailable ({provider} · {model}). Heuristic extraction remains active; AI re-analysis and briefing AI are currently unavailable.',
++  'ai.banner.headline.auth': 'The API key was rejected ({provider}). It is invalid, revoked, or belongs to another account.',
++  'ai.banner.headline.kein_guthaben': 'The {provider} account is out of credit or has hit its spend limit — the connection itself is fine.',
++  'ai.banner.headline.rate_limit': 'Too many requests in a short time ({provider}). This clears up on its own.',
++  'ai.banner.headline.ueberlastet': '{provider} is overloaded or disrupted. Nothing is wrong on this machine.',
++  'ai.banner.headline.network': 'No connection to {provider}. The most common cause is a corporate proxy or a firewall inspecting HTTPS — not an outage.',
++  'ai.banner.headline.model_not_found': 'The model "{model}" is not enabled for this account.',
++  'ai.banner.headline.timeout': '{provider} took too long ({model}).',
++  'ai.banner.selbsttest': 'Self-test',
++  'settings.ki.selbsttest.title': 'Self-test',
++  'settings.ki.selbsttest.intro': 'Six checks, cheapest first. The first one that fails is the cause.',
++  'settings.ki.selbsttest.run': 'Run self-test',
++  'settings.ki.selbsttest.running': 'Running…',
++  'settings.ki.selbsttest.copy': 'Copy diagnosis',
++  'settings.ki.selbsttest.copied': 'Copied',
++  'settings.ki.selbsttest.skipped': 'not checked',
++  'settings.ki.selbsttest.allOk': 'All checks passed.',
++  'settings.ki.selbsttest.failed': 'The cause is the first red line.',
+   'ai.banner.settings': 'Settings',
+   // ── Tasks ─────────────────────────────────────────────────────────────────
+   'tasks.col.task': 'Task',
+@@ -6031,6 +6067,23 @@ const es: Dict = {
+   'error.page.home': 'Panel',
+   // ── AI Banner ─────────────────────────────────────────────────────────────
+   'ai.banner.unavailable': 'Proveedor de IA no disponible ({provider} · {model}). La extracción heurística sigue activa; el re-análisis de IA y la IA de briefing no están disponibles actualmente.',
++  'ai.banner.headline.auth': 'La clave de API fue rechazada ({provider}). No es válida, fue revocada o pertenece a otra cuenta.',
++  'ai.banner.headline.kein_guthaben': 'La cuenta de {provider} no tiene saldo o alcanzó su límite de gasto — la conexión funciona.',
++  'ai.banner.headline.rate_limit': 'Demasiadas solicitudes en poco tiempo ({provider}). Se resuelve solo.',
++  'ai.banner.headline.ueberlastet': '{provider} está sobrecargado o con problemas. No es un fallo de este equipo.',
++  'ai.banner.headline.network': 'Sin conexión a {provider}. La causa más frecuente es un proxy corporativo o un firewall que inspecciona HTTPS — no una caída.',
++  'ai.banner.headline.model_not_found': 'El modelo «{model}» no está habilitado para esta cuenta.',
++  'ai.banner.headline.timeout': '{provider} tardó demasiado ({model}).',
++  'ai.banner.selbsttest': 'Autodiagnóstico',
++  'settings.ki.selbsttest.title': 'Autodiagnóstico',
++  'settings.ki.selbsttest.intro': 'Seis comprobaciones, de la más barata a la más cara. La primera que falla es la causa.',
++  'settings.ki.selbsttest.run': 'Ejecutar autodiagnóstico',
++  'settings.ki.selbsttest.running': 'Ejecutando…',
++  'settings.ki.selbsttest.copy': 'Copiar diagnóstico',
++  'settings.ki.selbsttest.copied': 'Copiado',
++  'settings.ki.selbsttest.skipped': 'no comprobado',
++  'settings.ki.selbsttest.allOk': 'Todas las comprobaciones correctas.',
++  'settings.ki.selbsttest.failed': 'La causa es la primera línea en rojo.',
+   'ai.banner.settings': 'Ajustes',
+   // ── Tasks ─────────────────────────────────────────────────────────────────
+   'tasks.col.task': 'Tarea',
+diff --git a/apps/frontend/src/pages/Settings.tsx b/apps/frontend/src/pages/Settings.tsx
+index c1481f5..3cf62ae 100644
+--- a/apps/frontend/src/pages/Settings.tsx
++++ b/apps/frontend/src/pages/Settings.tsx
+@@ -19,6 +19,7 @@ import { CheckCircle2, XCircle, Plug, Shield, FolderOpen, Cloud, Zap, Download,
+ import type { AiSettings, FolderWatcherSettings } from '@project-os/shared';
+ import { api } from '../lib/api';
+ import { CalendarSourcesManager } from '../components/settings/CalendarSourcesManager';
++import { KiSelbsttest } from '../components/settings/KiSelbsttest';
+ import { StatusLabelsEditor } from '../components/settings/StatusLabelsEditor';
+ import { VersionHistory } from '../components/settings/VersionHistory';
+ import { BackupRestorePanel } from '../components/settings/BackupRestorePanel';
+@@ -510,6 +511,10 @@ export function Settings() {
+       </section>
+       </>)}
+ 
++      {/* Selbsttest — steht bewusst direkt unter dem Verbindungstest: Der Test
++          sagt ob, der Selbsttest sagt woran. */}
++      {tab === 'ki' && <KiSelbsttest />}
++
+       {/* Anthropic Claude */}
+       {tab === 'ki' && (<>
+       <section className="rounded-xl border p-6 mb-5" style={{ backgroundColor: 'var(--surface)', borderColor: 'var(--border)' }}>
