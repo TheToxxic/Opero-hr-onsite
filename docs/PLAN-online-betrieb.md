@@ -2,7 +2,7 @@
 
 Stand 12.10.2026 · geprüft gegen `ProjectOS-src@13299d9` (Opero 3.0.x)
 
-**Ziel:** Opero hr-onsite läuft online und wird nur über den Webbrowser auf dem
+**Ziel:** Opero hr-onsite läuft online, **je eine eigene Instanz für Chris und Horst**, und wird nur über den Webbrowser auf dem
 Firmenrechner des Kunden genutzt, ohne Installation und ohne zweiten Rechner.
 Die Anbindung an Claude ist Pflicht.
 
@@ -28,9 +28,11 @@ synchron. Postgres (also Supabase) arbeitet asynchron. Ein Umstieg ist deshalb
 keine Konfigurationsfrage. Jede Abfrage muss umgeschrieben und auf `await`
 umgestellt werden, durch alle Services und Routen hindurch.
 
-Hinweis: Ein Repo „hr-onsite Cockpit“ gibt es in dieser Session nicht. Ich gehe
-davon aus, dass das Cockpit als Web-App mit Supabase läuft. Falls es anders
-aufgebaut ist, gilt Variante B entsprechend.
+Hinweis: Den Supabase-Stand des hr-onsite Cockpits finde ich weder in den
+Repos noch in den Claude-Code-Sessions dieses Kontos. Die einzige Cockpit-Session
+(„HR-Onsite Cockpit Internetanbindung Plan“, 03.08.2026) plant Opero hr-onsite
+selbst, und zwar über Cloudflare Tunnel und einen Hetzner-Server, nicht über
+Supabase. Ihre Befunde sind in Abschnitt 6 übernommen.
 
 ---
 
@@ -164,41 +166,108 @@ Variante, aber nicht jede ist erlaubt.
 
 ---
 
-## 6. Umsetzungsplan (Variante B, mit A als Kern)
+## 6. Entscheidungen (Stand 12.10.2026)
 
-| Phase | Inhalt | Aufwand | Ergebnis |
-|---|---|---|---|
-| **0 · Klären** | Punkte aus Abschnitt 5; Erreichbarkeitstest vom Firmenrechner | ½ Tag + Wartezeit | Go/No-Go |
-| *0b · Übergang (optional)* | Variante D: Tunnel auf den bestehenden Rechner | 1 Tag | sofort arbeitsfähig |
-| **1 · Web-Build** | `platform/web/` neben `platform/win/` anlegen (Regel aus `DEVELOPMENT.md`: keine Fachlogik dort): Dockerfile (Node 22, `better-sqlite3`), Express liefert das gebaute Frontend aus (der Windows-Patch „Static-Serving“ hat das schon gelöst), `OPERO_DATA_DIR=/data`. Lokale Provider (macOS-Kalender, Outlook-COM, ActivityWatch, Ordner-Watcher) per Umgebungsvariable `OPERO_RUNTIME=web` ausblenden | 1–2 Tage | Container läuft lokal |
-| **2 · Anmeldung** | Supabase-Projekt (EU), Auth mit MFA; Express-Middleware prüft JWT vor `/api/*`; Login-Seite im Frontend; CORS auf die eigene Domain | 1–2 Tage | Nur Angemeldete kommen rein |
-| **3 · Hosting** | Fly.io (fra) oder Hetzner + Caddy; Volume für `/data`; eigene Domain + TLS; nächtliches Backup der SQLite-Datei nach Supabase Storage; Secrets (`ANTHROPIC_API_KEY`, M365) als Umgebungsvariablen | 1 Tag | Online erreichbar |
-| **4 · Claude-Connector** | MCP-HTTP-Server im selben Container unter `/mcp`; OAuth über Supabase Auth; in claude.ai als Custom Connector eintragen; Persona aus `OPERO_PROJEKTAGENT.md` in ein claude.ai-Projekt übernehmen | 2–3 Tage | Projektagent im Browser |
-| **5 · Daten umziehen** | Bestehende `project-os.db` über die vorhandene Restore-Funktion (`pending-restore.db`) einspielen | ½ Tag | Altbestand online |
-| *6 · später* | Schreibende MCP-Werkzeuge über die Backend-API; Upload-Ersatz für den Ordner-Watcher (OneDrive/Graph) | je 2–3 Tage | |
-| *7 · nur bei Bedarf* | Variante C (Postgres), **nur** wenn Chris und Horst wirklich eine gemeinsame Datenbasis brauchen | 4–8 Wochen | |
+| Frage | Antwort | Folge |
+|---|---|---|
+| Wer nutzt es? | Chris und Horst | zwei Instanzen |
+| Gemeinsame Datenbasis? | **Nein, ausdrücklich getrennt** | Variante C (Postgres, Mehrbenutzer) entfällt |
+| Claude-Konten | je ein privates Pro-Konto, je eigener API-Key | ein Connector und ein Key **pro Instanz** |
+| Cockpit | läuft auf Supabase | Opero muss nicht dorthin, siehe 6.2 |
 
-**Gesamt bis Phase 5: ca. 7–10 Arbeitstage.**
+### 6.1 Zielbild: ein Server, zwei getrennte Instanzen
 
----
+```
+Hetzner-Server (DE)
+├── opero-chris → /srv/opero/chris  (eigene DB, Dokumente, API-Key)  → https://chris.<domain>
+└── opero-horst → /srv/opero/horst  (eigene DB, Dokumente, API-Key)  → https://horst.<domain>
+       ↑ Cloudflare Tunnel (keine offenen Ports) + Cloudflare Access (Login je Person)
+```
 
-## 7. Empfehlung
+Die Trennung kommt über getrennte Prozesse/Container, Datenverzeichnisse,
+Adressen und Zugangsregeln, nicht über Rechte im Code. Das passt zur App:
+Sie ist für genau einen Nutzer gebaut.
 
-1. **Zuerst Phase 0.** Ohne Freigabe für Kundendaten in einer eigenen Cloud
-   bringt keine Variante etwas, und genau daran scheitert so etwas meistens.
-2. **Dann Variante B:** bestehende App im Container mit SQLite, Supabase nur für
-   Login und Backups. Das geht schnell, die Fachlogik bleibt unberührt, und die
-   Windows-Version läuft mit demselben Code weiter.
-3. **Claude zweigleisig:** API-Key im Backend (sofort) plus Remote-MCP-Connector
-   in claude.ai (Phase 4). Das ist der Schritt, der wirklich etwas bringt, weil
-   der Projektagent danach ohne Claude Desktop auskommt.
-4. **Nicht nach Supabase-Postgres migrieren, nur weil das Cockpit dort liegt.**
-   937 Raw-SQL-Stellen umzubauen lohnt sich erst, wenn mehrere Personen
-   gemeinsam auf einer Datenbasis arbeiten müssen.
+Laufende Kosten für beide zusammen: Server ca. 10–16 €, Backup ca. 4 €,
+Cloudflare Tunnel und Access 0 €, Domain ca. 1 €, **zusammen ca. 15–21 €/Monat**.
+Dazu kommen die API-Kosten bei Anthropic wie bisher.
 
-### Offene Fragen an dich
+### 6.2 Warum nicht Supabase und was mit der Domain ist
 
-- Läuft das hr-onsite Cockpit auf Supabase, und soll dieselbe Anmeldung gelten?
-- Nur du, oder auch Horst? Getrennte Daten oder eine gemeinsame Datenbasis?
-- Privates claude.ai-Konto (Pro/Max) oder Team/Enterprise?
-- Eigene Domain vorhanden (z. B. `opero.hr-onsite.de`)?
+- **Supabase kann Opero nicht betreiben.** Supabase stellt Postgres, Auth,
+  Storage und Edge Functions bereit (Deno, kurzlebig, ohne dauerhaftes
+  Dateisystem). Opero braucht einen dauerhaft laufenden Node-Prozess mit
+  SQLite-Datei, Mail-Sync, Kalender-Sync und OCR. Das läuft dort nicht.
+- **Eine Domain bekommt man bei Supabase nicht.** Supabase verkauft keine
+  Domains. Eine eigene Domain lässt sich dort nur mit einem kostenpflichtigen
+  Add-on auf die eigene API/Auth legen, und das setzt einen bezahlten Plan
+  voraus. Für Opero hilft das nicht.
+- **So geht es:** Domain beim Registrar (oder vorhandene Firmendomain), die
+  Subdomains `chris.` und `horst.` auf Cloudflare zeigen lassen. Läuft die
+  Domain schon über Cloudflare oder ist sie dahin umziehbar, ist das in
+  einer Stunde erledigt. Die Nameserver-Umstellung kann bis 24 h dauern und
+  ist damit der längste Vorlauf.
+- **Wenn ein Login wie im Cockpit gewünscht ist:** Supabase Auth ließe sich
+  vor Opero setzen (Variante B oben). Bei zwei Einzelinstanzen ist
+  Cloudflare Access aber einfacher, weil kein Code nötig ist.
+
+### 6.3 Claude-Anbindung pro Person
+
+| | Chris | Horst |
+|---|---|---|
+| KI in der App | eigener `ANTHROPIC_API_KEY` in der Instanz | eigener Key |
+| claude.ai (Pro) Custom Connector | `https://chris.<domain>/mcp` | `https://horst.<domain>/mcp` |
+| Projektagent-Persona | eigenes claude.ai-Projekt | eigenes claude.ai-Projekt |
+
+Wichtig für den Connector: Die Anfragen kommen von Anthropics Servern, nicht
+aus dem Browser. Die E-Mail-Code-Anmeldung von Cloudflare Access können die
+nicht bestehen. `/mcp` wird deshalb aus Access ausgenommen und bekommt eine
+eigene OAuth-Prüfung im MCP-Server (siehe Abschnitt 4). Ohne Schutz bleibt
+der Endpunkt nie offen.
+
+### 6.4 Befunde aus dem Code, die vor dem Go-live behoben sein müssen
+
+Im aktuellen Quellstand gegengeprüft (`ProjectOS-src@13299d9`):
+
+| Befund | Fundstelle | Warum kritisch |
+|---|---|---|
+| **Dokumentenpfad hängt an `__dirname`, nicht an `OPERO_DATA_DIR`** | `services/storageSettings.ts:15-16` | Zwei Instanzen auf einem Server würden **denselben Dokumentenordner** teilen: Chris' Dateien landen bei Horst, ohne dass die Oberfläche es zeigt. Muss vor der Migration behoben sein |
+| Keine Authentifizierung im Backend | alle `routes/` | Access ist die erste Schicht, das Backend braucht eine zweite (Access-JWT prüfen) |
+| MS365-Redirect fest auf `localhost:3001` | `ms365/auth.ts:32,39`, `Settings.tsx:2148` | Anmeldung bricht online mit `AADSTS50011` ab |
+| ICS-Export mit `localhost:3001` als Fallback | `useFollowUps.ts:87` | liefert online eine leere Datei |
+| Static-Serving nur im Windows-Patch | `platform/win/scripts/patch-for-windows.js` | muss in `app.ts`, sonst läuft das Frontend nicht ohne Vite |
+| Cloudflare bricht nach 100 s ab, KI-Timeouts liegen bei 90–120 s | `services/ai/index.ts` | auf 85 s kappen oder lange Aufrufe im Hintergrund laufen lassen |
+| Cloudflare-Upload-Grenze 100 MB | `bulkIntake.ts` | Bulk-Upload im Browser stückeln |
+| `pdftoppm` (poppler-utils) fehlt auf einem nackten Server | `intake/pdfOcr.ts` | PDF-OCR bricht still ab, deshalb ins Image aufnehmen |
+| MS-To-Do-Erinnerungen nur unter `win32` | `reminders/index.ts` | auf Linux tot, obwohl Graph überall geht (3-Zeilen-Fix) |
+
+## 7. Umsetzungsplan
+
+| Phase | Inhalt | Aufwand |
+|---|---|---|
+| **0 · Klären** | Freigabe des Kunden für Daten in eigener Cloud (AVV mit Hetzner und Cloudflare; bei BEM-/Betriebsratsfällen Art. 9 DSGVO); ist claude.ai am Firmenrechner erlaubt und erreichbar; Domain festlegen | ½ Tag + Wartezeit |
+| **1 · Code-Fixes** | die Befunde aus 6.4 in `ProjectOS-src` (zuerst `storageSettings`, mit Test) | 1–2 Tage |
+| **2 · Web-Build** | `platform/web/`: Dockerfile (Node 22, poppler, tesseract), `OPERO_RUNTIME=web` blendet lokale Provider aus | 1 Tag |
+| **3 · Server** | Hetzner (DE), zwei Container mit je eigenem Volume und eigenen Secrets, nächtliches Backup außer Haus | 1 Tag |
+| **4 · Zugang** | Cloudflare Tunnel und Access je Subdomain, **erst Access-Regel, dann Tunnel dauerhaft** (sonst steht die App kurz offen im Netz); Zugriffsprotokoll an | ½ Tag |
+| **5 · Claude** | MCP-Server je Instanz unter `/mcp` mit OAuth; Connector in beiden Pro-Konten eintragen; Persona aus `OPERO_PROJEKTAGENT.md` als claude.ai-Projekt | 2–3 Tage |
+| **6 · Migration** | je Person: WAL-Checkpoint, DB und Dokumente hochladen, Stichtag, Abnahme vom Firmenrechner aus | ½ Tag je Person |
+
+**Gesamt: ca. 7–9 Arbeitstage**, danach ca. 15–21 €/Monat.
+
+## 8. Was dabei wegfällt
+
+| Funktion | Betrifft | Ersatz |
+|---|---|---|
+| macOS-Kalender (Fantastical/EventKit) | nur Chris | MS365-Kalender oder ICS-Abo |
+| Erinnerungen.app | nur Chris | MS To Do über Graph (nach Fix) |
+| ActivityWatch-Zeiterfassung | beide | keiner; bleibt lokal oder entfällt |
+| Ordner-Watcher (Plaud) | beide | Upload im Browser oder OneDrive über rclone/Graph |
+
+## 9. Noch offen
+
+- Wo liegt der Supabase-Stand des Cockpits (Repo oder Projekt-URL)? Nur nötig,
+  wenn Opero dieselbe Anmeldung bekommen soll.
+- Welche Domain? Liegt `hr-onsite.de` (o. ä.) schon bei Cloudflare?
+- Dürft ihr Kundendaten auf einem eigenen Server halten, und ist claude.ai am
+  Firmenrechner freigegeben?
