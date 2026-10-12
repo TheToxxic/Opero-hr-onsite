@@ -241,6 +241,22 @@ Im aktuellen Quellstand gegengeprüft (`ProjectOS-src@13299d9`):
 | `pdftoppm` (poppler-utils) fehlt auf einem nackten Server | `intake/pdfOcr.ts` | PDF-OCR bricht still ab, deshalb ins Image aufnehmen |
 | MS-To-Do-Erinnerungen nur unter `win32` | `reminders/index.ts` | auf Linux tot, obwohl Graph überall geht (3-Zeilen-Fix) |
 
+### 6.5 VM-Anforderungen (Server von weishe.it)
+
+Für zwei Instanzen (Chris und Horst), ohne lokale KI, da Claude über die API läuft:
+
+| | Minimum | Empfohlen |
+|---|---|---|
+| CPU | 2 vCPU | 4 vCPU (OCR und PDF-Import laufen sonst zäh) |
+| RAM | 4 GB | 8 GB (je Instanz ca. 0,5 GB im Leerlauf, 1–1,5 GB bei OCR-Spitzen) |
+| Platte | 60 GB SSD | 100–160 GB SSD/NVMe (Datenbestand heute ca. 2–3 GB je Person, plus lokale Backups und Docker-Images) |
+| OS | Ubuntu 24.04 LTS oder Debian 12, x86_64 | |
+| Netz | ausgehend HTTPS; eingehend nur SSH | Cloudflare Tunnel braucht keine offenen Ports |
+
+Vorher mit dem Betreiber klären: Standort in Deutschland/EU, AVV (er wird
+Auftragsverarbeiter für Kundendaten), wer Root-Zugriff hat, Snapshots oder
+Backups und eine Erreichbarkeit für Störungen.
+
 ## 7. Umsetzungsplan
 
 | Phase | Inhalt | Aufwand |
